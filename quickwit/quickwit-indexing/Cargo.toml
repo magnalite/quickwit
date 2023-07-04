@@ -46,6 +46,12 @@ ulid = { workspace = true }
 utoipa = { workspace = true }
 vrl = { workspace = true }
 vrl-stdlib = { workspace = true }
+#google-cloud-bigquery = { path = "../../../google-cloud-rust/bigquery" }
+#google-cloud-default = { path = "../../../google-cloud-rust/default", features = ["bigquery"] }
+#google-cloud-googleapis = { path = "../../../google-cloud-rust/googleapis", features = ["bigquery"] }
+google-cloud-bigquery = "0.1.1"
+google-cloud-default = { version = "0.4.0", features = ["bigquery"] }
+google-cloud-googleapis = { version = "0.10.0", features = ["bigquery"] }
 
 quickwit-actors = { workspace = true }
 quickwit-aws = { workspace = true }

@@ -88,6 +88,7 @@ pub struct SourceConfig {
 impl SourceConfig {
     pub fn source_type(&self) -> &str {
         match self.source_params {
+            SourceParams::BigQuery(_) => "bigquery",
             SourceParams::File(_) => "file",
             SourceParams::Kafka(_) => "kafka",
             SourceParams::Kinesis(_) => "kinesis",
@@ -102,6 +103,7 @@ impl SourceConfig {
     // TODO: Remove after source factory refactor.
     pub fn params(&self) -> JsonValue {
         match &self.source_params {
+            SourceParams::BigQuery(params) => serde_json::to_value(params),
             SourceParams::File(params) => serde_json::to_value(params),
             SourceParams::Kafka(params) => serde_json::to_value(params),
             SourceParams::Kinesis(params) => serde_json::to_value(params),
@@ -204,6 +206,8 @@ impl FromStr for SourceInputFormat {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(tag = "source_type", content = "params")]
 pub enum SourceParams {
+    #[serde(rename = "bigquery")]
+    BigQuery(BigQuerySourceParams),
     #[serde(rename = "file")]
     File(FileSourceParams),
     #[serde(rename = "kafka")]
@@ -238,6 +242,38 @@ impl SourceParams {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
+pub struct BigQuerySourceParams {
+    pub project_id: String,
+    pub dataset_id: String,
+    pub table_id: String,
+
+    /// The name of the timestamp column
+    pub time_column: String,
+
+    /// A timestamp where ingestion should start from. For now the source will attempt
+    /// to ingest from this to the beginning of the BigQuery streaming buffer. It will
+    /// then await the streaming buffer to progress before ingesting up to that new
+    /// timestamp.
+    ///
+    /// Format is [year]-[month]-[day] [hour]:[minute]:[second] [offset_hour sign:mandatory]:[offset_minute]:[offset_second]
+    pub ingest_start: String,
+
+    /// The number of gRPC streams to use when reading the BigQuery storage API. Default is 4.
+    /// More streams means a higher total throughput of data can be downloaded.
+    /// Default project-wide quota is 2000 streams in multi-region and 400 streams in single-region.
+    /// https://cloud.google.com/bigquery/quotas#storage-limits
+    pub read_streams: Option<usize>,
+
+    /// Optional flag to force commit every batch pulled from BigQuery. Default is false.
+    /// This will lower ingest latency but increase the number of splits generated requiring
+    /// more merge operations.
+    pub force_commit: Option<bool>,
+
+    pub enable_debug_output: Option<bool>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct FileSourceParams {
     /// Path of the file to read. Assume stdin if None.
     #[schema(value_type = String)]
@@ -249,7 +285,9 @@ pub struct FileSourceParams {
 
 // Deserializing a filepath string into an absolute filepath.
 fn absolute_filepath_from_str<'de, D>(deserializer: D) -> Result<Option<PathBuf>, D::Error>
-where D: Deserializer<'de> {
+where
+    D: Deserializer<'de>,
+{
     let filepath_opt: Option<String> = Deserialize::deserialize(deserializer)?;
     if let Some(filepath) = filepath_opt {
         let uri = Uri::from_str(&filepath).map_err(D::Error::custom)?;
@@ -389,7 +427,9 @@ pub enum PulsarSourceAuth {
 
 // Deserializing a string into an pulsar uri.
 fn pulsar_uri<'de, D>(deserializer: D) -> Result<String, D::Error>
-where D: Deserializer<'de> {
+where
+    D: Deserializer<'de>,
+{
     let uri: String = Deserialize::deserialize(deserializer)?;
 
     if uri.strip_prefix("pulsar://").is_none() {

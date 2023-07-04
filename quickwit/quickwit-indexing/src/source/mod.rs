@@ -57,6 +57,7 @@
 //!   that file.
 //! - the kafka source: the partition id is a kafka topic partition id, and the position is a kafka
 //!   offset.
+mod bigquery_source;
 mod file_source;
 mod ingest_api_source;
 #[cfg(feature = "kafka")]
@@ -75,6 +76,7 @@ use std::time::Duration;
 
 use anyhow::bail;
 use async_trait::async_trait;
+pub use bigquery_source::{BigQuerySource, BigQuerySourceFactory};
 pub use file_source::{FileSource, FileSourceFactory};
 #[cfg(feature = "kafka")]
 pub use kafka_source::{KafkaSource, KafkaSourceFactory};
@@ -286,6 +288,7 @@ pub fn quickwit_supported_sources() -> &'static SourceLoader {
     static SOURCE_LOADER: OnceCell<SourceLoader> = OnceCell::new();
     SOURCE_LOADER.get_or_init(|| {
         let mut source_factory = SourceLoader::default();
+        source_factory.add_source("bigquery", BigQuerySourceFactory);
         source_factory.add_source("file", FileSourceFactory);
         #[cfg(feature = "kafka")]
         source_factory.add_source("kafka", KafkaSourceFactory);
