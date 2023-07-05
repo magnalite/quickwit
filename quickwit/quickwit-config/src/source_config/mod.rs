@@ -258,6 +258,23 @@ pub struct BigQuerySourceParams {
     /// Format is [year]-[month]-[day] [hour]:[minute]:[second] [offset_hour sign:mandatory]:[offset_minute]:[offset_second]
     pub ingest_start: String,
 
+    /// An optional timestamp where ingestion should stop. Same format as ingest_start.
+    /// If None (default) ingestion will continuously stream in rows.
+    ///
+    /// This enables deploying across multiple pipelines by defining separate ingest
+    /// windows to consume from, eg 1 day each.
+    ///
+    /// Ingestion will include rows where ingest_start <= time_column < ingest_end
+    pub ingest_end: Option<String>,
+
+    /// How long in seconds the time slice window should be. Default 60 seconds.
+    /// This is a measure of how many rows will be ingested at a time. We want to target
+    /// row batches of ~100MB. Depending on how packed the table is this could be a
+    /// 5 second slice or a 1 hour slice. If the value is too low it can reduce throughput
+    /// due to overhead in creating new read sessions. If the value is too high it
+    /// uses significantly more memory and causes uneven ingest rates.
+    pub time_window_size: Option<i64>,
+
     /// The number of gRPC streams to use when reading the BigQuery storage API. Default is 4.
     /// More streams means a higher total throughput of data can be downloaded.
     /// Default project-wide quota is 2000 streams in multi-region and 400 streams in single-region.

@@ -52,6 +52,7 @@ vrl-stdlib = { workspace = true }
 google-cloud-bigquery = "0.1.1"
 google-cloud-default = { version = "0.4.0", features = ["bigquery"] }
 google-cloud-googleapis = { version = "0.10.0", features = ["bigquery"] }
+google-cloud-gax = "0.15.0"
 
 quickwit-actors = { workspace = true }
 quickwit-aws = { workspace = true }
