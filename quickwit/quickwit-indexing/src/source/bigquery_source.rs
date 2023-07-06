@@ -79,6 +79,7 @@ pub struct BigQuerySourceState {
     current_time: OffsetDateTime,
     target_time: OffsetDateTime,
     batches: VecDeque<JoinHandle<anyhow::Result<BatchBuilder>>>,
+    last_known_streaming_buffer_time: Option<i64>,
 }
 
 pub struct BigQuerySource {
@@ -181,6 +182,7 @@ impl BigQuerySource {
                 // to correctly increment the target time respecting the streaming buffer
                 target_time: current_time,
                 batches: VecDeque::new(),
+                last_known_streaming_buffer_time: None,
             },
             publish_lock,
             client,
@@ -387,24 +389,36 @@ impl BigQuerySource {
     // If we have ingested up to the streaming buffer then that is indicated by
     // setting current_time == target_time
     async fn increment_time_window(&mut self) -> anyhow::Result<()> {
-        let table_info = self
-            .client
-            .table()
-            .get(
-                self.source_table.project_id.as_str(),
-                self.source_table.dataset_id.as_str(),
-                self.source_table.table_id.as_str(),
-            )
-            .await?;
+        let mut streaming_buffer_time = None;
 
-        let oldest_entry = match table_info.streaming_buffer {
-            Some(buffer) => buffer.oldest_entry_time,
-            None => None,
-        };
+        if let Some(cached_time) = self.state.last_known_streaming_buffer_time {
+            if cached_time > self.state.target_time.unix_timestamp() + self.time_window_size {
+                streaming_buffer_time = Some(cached_time);
+            }
+        }
+
+        if streaming_buffer_time.is_none() {
+            let table_info = self
+                .client
+                .table()
+                .get(
+                    self.source_table.project_id.as_str(),
+                    self.source_table.dataset_id.as_str(),
+                    self.source_table.table_id.as_str(),
+                )
+                .await?;
+
+            streaming_buffer_time = match table_info.streaming_buffer {
+                Some(buffer) => buffer.oldest_entry_time.map(|x| x as i64),
+                None => None,
+            };
+
+            self.state.last_known_streaming_buffer_time = streaming_buffer_time;
+        }
 
         let mut new_target_time = self.state.target_time.unix_timestamp() + self.time_window_size;
-        if let Some(oldest_entry) = oldest_entry {
-            let oldest_entry_seconds = oldest_entry as i64 / 1000;
+        if let Some(oldest_entry) = streaming_buffer_time {
+            let oldest_entry_seconds = oldest_entry / 1000;
 
             if oldest_entry_seconds < new_target_time {
                 new_target_time = oldest_entry_seconds;
