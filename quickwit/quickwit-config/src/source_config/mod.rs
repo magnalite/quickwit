@@ -269,21 +269,32 @@ pub struct BigQuerySourceParams {
 
     /// How long in seconds the time slice window should be. Default 60 seconds.
     /// This is a measure of how many rows will be ingested at a time. We want to target
-    /// row batches of ~100MB. Depending on how packed the table is this could be a
-    /// 5 second slice or a 1 hour slice. If the value is too low it can reduce throughput
+    /// row batches of ~10MB. Depending on how packed the table is this could be a
+    /// 1 second slice or a 1 hour slice. If the value is too low it can reduce throughput
     /// due to overhead in creating new read sessions. If the value is too high it
     /// uses significantly more memory and causes uneven ingest rates.
+    ///
+    /// It is best to use a small window size with many reads streams.
     pub time_window_size: Option<i64>,
 
     /// The number of gRPC streams to use when reading the BigQuery storage API. Default is 4.
     /// More streams means a higher total throughput of data can be downloaded.
     /// Default project-wide quota is 2000 streams in multi-region and 400 streams in single-region.
     /// https://cloud.google.com/bigquery/quotas#storage-limits
+    ///
+    /// Using more streams will result in higher throughput at the cost of higher memory usage.
+    /// It is best to use a small window size with many reads streams.
+    ///
+    /// Using excessive read streams will not increase throughput any further. Once the max
+    /// throughput has been reached further streams will only result in more memory overhead
+    /// and uneven ingest rates.
     pub read_streams: Option<usize>,
 
     /// Optional flag to force commit every batch pulled from BigQuery. Default is false.
     /// This will lower ingest latency but increase the number of splits generated requiring
-    /// more merge operations.
+    /// more merge operations. This is only recommended when ingesting against the streaming
+    /// buffer and you absolutly need the fastest ingest time possible. Even if that is the
+    /// case be aware that the streaming buffer can be delayed by up to 2 hours.
     pub force_commit: Option<bool>,
 
     pub enable_debug_output: Option<bool>,

@@ -1,4 +1,4 @@
-use std::{sync::Arc, time::Duration};
+use std::{collections::VecDeque, sync::Arc, time::Duration};
 
 use anyhow::Context;
 use async_trait::async_trait;
@@ -19,7 +19,7 @@ use quickwit_metastore::checkpoint::{
 use serde_json::{json, Value as JsonValue};
 use time::{macros::format_description, OffsetDateTime};
 use tokio::{
-    sync::Mutex,
+    task::JoinHandle,
     time::{sleep, Instant},
 };
 use tracing::{info, warn};
@@ -42,55 +42,20 @@ use super::{Source, SourceActor, SourceContext, SourceExecutionContext, TypedSou
         3) Rows do not need a unique id or a row number. We need to be able to support tables
             which take any form, including lack of primary key or row numbers.
 
-    To overcome all those challenges we need a way to keep track of which rows we have ingested.
-    In order to do this we can move data we intend to ingest to an immutable "staging" table adding
-    a hash for the rows data (*a). This table will include all rows which exist in a timestamp range.
-    We can then use that timestamp range as our partition checkpoint. eg once we have ingested the
-    entire staging table we can move the checkpoint to the final timestamp.
-
-    Once we finish ingesting the staging table we can then query the next timestamp range and merge
-    it into the staging table. We want to drop any rows which have the same hash and only keep rows
-    which were not in the staging table before. This allows us to have overlapping timestamp ranges
-    whilst maintaining exactly once delivery.
-
-    We can now repeat this process to continually move new data into the staging table and then ingesting.
-
-    As the staging table can live for as long as we need it we can gracefully recover in the event
-    the source/pipeline/indexer goes offline. We can resume by ingesting the staging table and then
-    incrementing the checkpoint as before.
-
-    It is important to note that we need two variables here.
-        1) Window width
-        2) Query rate
-
-    The window width is the range of the timestamps we use. Typically this should be ~2 hours to ensure
-    we include the entire streaming buffer. The query rate is how often we will requery this window to ingest
-    new data.
-
-    As an example if we have a window width of 2 hours and a query rate of 10 mins then we check the past 2 hours
-    for new data every 10 mins. Additionally we shift the checkpoint by a maximum of the window width. If we are
-    ingesting historical data then we can ingest in 2 hour windows with no overlap until we reach the current
-    timestamp (or the end of the table) where we then requery at the current timestamp at the query rate with the
-    query window overlapping. Importantly a query rate of 10 mins means the ingest latency will be ~10 mins.
-
-    Users can adjust the window width and query rate to suit their needs. A larger window width decreases the
-    likelihood we miss rows from the streaming buffer (approaching near 0 at 2 hours) but increases the cost
-    in terms of redundant work done by BigQuery. A faster query rate will reduce ingest latency but also increase
-    cost due to redundant work. In either case BigQuery does all the redundant work instead of Quickwit.
-
-    *a: Due to relying on hashes we cannot support multiple rows which have the exact same data. In practice
-        that should be rare and not a big issue.
-
-
-    *** For low latency ingest this is a very expensive solution if using editions pricing. On-demand pricing is likely
-    *** ok bit still far from ideal. It may be cheaper to do this hashing and comparing in Quickwit although could incur
-    *** a significant memory penalty for large streamer buffer delay times.
-
-    As a cheaper alternative we can only ingest up until the beginning of the streaming buffer, then wait for the streaming
-    buffer to update and ingest up to the next earliest row in the streaming buffer. This removes all redundant work and
-    should be far cheaper. This however limits the minimum ingest latency to the max streaming buffer time. In practice, for
-    reasonable volumes of data, the streaming buffer is generally only ~2-3 mins behind real time. It is however not guaranteed
+    To overcome those challenges we only ingest up until the beginning of the streaming buffer,
+    then wait for the streaming buffer to update and ingest up to the next earliest row in the
+    streaming buffer. This limits the minimum ingest latency to the max streaming buffer time
+    which is not ideal but it is efficient. In practice, for reasonable volumes of data, the
+    streaming buffer is generally only ~2-3 mins behind real time. It is however not guaranteed
     so ingest latency could vary by up to 2 hours especially for low volume tables.
+
+    We ingest data in small batches using timestamp windows. This way we can guarantee we
+    collect every row without having to ingest a huge amount of data. Each window is
+    submitted as a batch and follows the usual checkpoint semantics nicely. A pool of
+    consumers are created to concurrently pull multiple batches but they are delivered
+    to the DocProcessor in order. This allows us to achieve high throughput by avoiding
+    the read session initialisation latency whilst delivering smaller batches to the
+    DocProcessor.
 */
 
 pub struct BigQuerySourceFactory;
@@ -113,6 +78,7 @@ pub struct BigQuerySourceState {
     doc_count: u64,
     current_time: OffsetDateTime,
     target_time: OffsetDateTime,
+    batches: VecDeque<JoinHandle<anyhow::Result<BatchBuilder>>>,
 }
 
 pub struct BigQuerySource {
@@ -121,13 +87,12 @@ pub struct BigQuerySource {
     publish_lock: PublishLock,
     client: google_cloud_bigquery::client::Client,
     source_table: TableReference,
-    bigquery_consumer: Option<Mutex<storage::Iterator<storage::row::Row>>>,
     partition_id: PartitionId,
-    batch_builder: BatchBuilder,
     use_force_commit: bool,
     time_column: String,
     time_window_size: i64,
     ingest_end: Option<OffsetDateTime>,
+    read_streams: usize,
 }
 
 impl BigQuerySource {
@@ -137,13 +102,14 @@ impl BigQuerySource {
         checkpoint: SourceCheckpoint,
     ) -> anyhow::Result<Self> {
         let publish_lock = PublishLock::default();
+        let read_streams = params.read_streams.unwrap_or(4);
 
         let (config, _) = ClientConfig::new_with_auth().await.unwrap();
         let client = google_cloud_bigquery::client::Client::new(
             config
                 .with_debug(params.enable_debug_output.unwrap_or(false))
                 .with_streaming_read_config(ChannelConfig {
-                    num_channels: params.read_streams.unwrap_or(4),
+                    num_channels: read_streams,
                     // TODO: Ensure 5 second timeouts are ok? This seems extremely low
                     // however if this is ok it simplifies our ingestion logic.
                     //
@@ -214,13 +180,12 @@ impl BigQuerySource {
                 // Here we set the target_time = current time and allow increment_time_window
                 // to correctly increment the target time respecting the streaming buffer
                 target_time: current_time,
+                batches: VecDeque::new(),
             },
             publish_lock,
             client,
             source_table,
-            bigquery_consumer: None,
             partition_id,
-            batch_builder: BatchBuilder::default(),
             use_force_commit: params.force_commit.unwrap_or(false),
             time_column: params.time_column,
             // TODO: We can likely dynamically adjust the time_window_size depending on
@@ -230,6 +195,7 @@ impl BigQuerySource {
             // can change significantly through a table and is also generally confusing.
             time_window_size: params.time_window_size.unwrap_or(60),
             ingest_end,
+            read_streams,
         })
     }
 }
@@ -278,19 +244,19 @@ impl Source for BigQuerySource {
         ctx: &SourceContext,
     ) -> Result<Duration, ActorExitStatus> {
         let now = Instant::now();
-        let mut reached_end_of_batch = false;
+        let mut batch = None;
 
         {
-            let consumer = self.consume_rows();
+            let incoming_batch = self.threaded_consume_rows();
             let emergency_deadline = sleep(Duration::from_secs(600));
 
-            tokio::pin!(consumer);
+            tokio::pin!(incoming_batch);
             tokio::pin!(emergency_deadline);
 
             loop {
                 tokio::select! {
-                    reached_end = &mut consumer => {
-                        reached_end_of_batch = reached_end?;
+                    pulled_batch = &mut incoming_batch => {
+                        batch = pulled_batch?;
                         break;
                     }
                     _ = sleep(*quickwit_actors::HEARTBEAT / 2) => { ctx.record_progress() }
@@ -313,32 +279,16 @@ impl Source for BigQuerySource {
         //
         // BigQuery can give us an expected read session size in bytes which we could
         // instead use to dynamically resize the window. It is however only approximate.
-        if reached_end_of_batch {
-            self.batch_builder
-                .checkpoint_delta
-                .record_partition_delta(
-                    self.partition_id.clone(),
-                    Position::from(self.state.current_time.unix_timestamp()),
-                    Position::from(self.state.target_time.unix_timestamp()),
-                )
-                .context("Failed to record partition delta.")?;
+        if let Some(batch) = &mut batch {
+            info!(
+                num_docs=%batch.docs.len(),
+                num_bytes=%batch.num_bytes,
+                num_millis=%now.elapsed().as_millis(),
+                "Sending doc batch to indexer.");
 
-            if self.batch_builder.num_bytes > 0 {
-                info!(
-                    num_docs=%self.batch_builder.docs.len(),
-                    num_bytes=%self.batch_builder.num_bytes,
-                    num_millis=%now.elapsed().as_millis(),
-                    source_total_docs=%self.state.doc_count,
-                    "Sending doc batch to indexer.");
-
-                let message = self.batch_builder.build(self.use_force_commit);
-                ctx.send_message(doc_processor_mailbox, message).await?;
-            }
-
-            self.increment_time_window().await?;
-        }
-
-        if let Some(ingest_end) = self.ingest_end {
+            let message = batch.build(self.use_force_commit);
+            ctx.send_message(doc_processor_mailbox, message).await?;
+        } else if let Some(ingest_end) = self.ingest_end {
             if self.state.current_time >= ingest_end {
                 info!("Reached end of ingestion window!");
                 ctx.send_exit_with_success(doc_processor_mailbox).await?;
@@ -378,72 +328,59 @@ impl Source for BigQuerySource {
 }
 
 impl BigQuerySource {
-    async fn create_bigquery_consumer(
-        &mut self,
-    ) -> anyhow::Result<storage::Iterator<storage::row::Row>> {
-        let row_restriction = format!(
-            "{time_column} >= timestamp_seconds({}) AND {time_column} < timestamp_seconds({})",
-            self.state.current_time.unix_timestamp(),
-            self.state.target_time.unix_timestamp(),
-            time_column = self.time_column,
-        );
-
-        let read_options = TableReadOptions {
-            row_restriction,
-            ..Default::default()
-        };
-
-        let retry_options = RetrySetting {
-            from_millis: 10,
-            max_delay: Some(Duration::from_secs(1)),
-            factor: 1u64,
-            take: 5,
-            codes: vec![Code::Unavailable, Code::Unknown],
-        };
-
-        let options = Some(
-            ReadTableOption::default()
-                .with_session_read_options(read_options)
-                .with_session_retry_setting(retry_options.clone())
-                .with_read_rows_retry_setting(retry_options),
-        );
-
-        Ok(self
-            .client
-            .read_table::<storage::row::Row>(&self.source_table, options)
-            .await?)
-    }
-
-    // Moves rows into the current batch. BigQuery consumers are automatically created and
-    // and dropped. Ok(true) is returned if we have reached the end of the current time window.
-    // If we have ingested up to the streaming buffer it will sleep before returning to ensure we
-    // don't spam api requests unnecessarily.
-    async fn consume_rows(&mut self) -> anyhow::Result<bool> {
+    // Manages a pool of consumers and returns the next batch when it is ready.
+    // Ok(None) is returned if we have reached the streaming buffer. In this case
+    // it will sleep before returning to ensure we don't spam api requests unnecessarily.
+    async fn threaded_consume_rows(&mut self) -> anyhow::Result<Option<BatchBuilder>> {
         if self.state.current_time == self.state.target_time {
+            if !self.state.batches.is_empty() {
+                return Ok(Some(self.state.batches.pop_front().unwrap().await??));
+            }
+
             info!("Awaiting streaming buffer update...");
             sleep(Duration::from_secs(5)).await;
             self.increment_time_window().await?;
-            return Ok(false);
+            return Ok(None);
         }
 
-        let reached_end_of_batch;
-
-        let mut consumer = self.create_bigquery_consumer().await?;
-        loop {
-            // TODO: Handle error case here (bigquery api can return errors)
-            if let Some(row) = consumer.next().await? {
-                let data = process_row(row)?;
-                let length = data.len() as u64;
-                self.batch_builder.push(data, length);
-                self.state.doc_count += 1;
-            } else {
-                reached_end_of_batch = true;
-                self.bigquery_consumer = None;
+        while self.state.batches.len() < self.read_streams {
+            if self.state.current_time == self.state.target_time {
                 break;
             }
+
+            let mut batch = BatchBuilder::default();
+            batch
+                .checkpoint_delta
+                .record_partition_delta(
+                    self.partition_id.clone(),
+                    Position::from(self.state.current_time.unix_timestamp()),
+                    Position::from(self.state.target_time.unix_timestamp()),
+                )
+                .context("Failed to record partition delta.")?;
+
+            let current_time = self.state.current_time;
+            let target_time = self.state.target_time;
+            let time_column = self.time_column.clone();
+            let client = self.client.clone();
+            let source_table = self.source_table.clone();
+
+            self.state.batches.push_back(tokio::spawn(async move {
+                let consumer = create_bigquery_consumer(
+                    current_time,
+                    target_time,
+                    time_column,
+                    client,
+                    &source_table,
+                )
+                .await
+                .unwrap();
+                pull_consumer(consumer, batch).await
+            }));
+
+            self.increment_time_window().await?;
         }
 
-        Ok(reached_end_of_batch)
+        Ok(Some(self.state.batches.pop_front().unwrap().await??))
     }
 
     // Increments the time window ensuring we do not run into the streaming buffer
@@ -502,4 +439,58 @@ fn process_row(row: storage::row::Row) -> anyhow::Result<Bytes> {
     parsed_data["timestamp"] = json!(timestamp.unix_timestamp_nanos());
 
     Ok(Bytes::from(parsed_data.to_string()))
+}
+
+async fn pull_consumer(
+    mut consumer: storage::Iterator<storage::row::Row>,
+    mut batch: BatchBuilder,
+) -> anyhow::Result<BatchBuilder> {
+    // TODO: Handle error case here (bigquery api can return errors)
+    while let Some(row) = consumer.next().await? {
+        let data = process_row(row)?;
+        let length = data.len() as u64;
+        batch.push(data, length);
+        //self.state.doc_count += 1;
+    }
+
+    Ok(batch)
+}
+
+async fn create_bigquery_consumer(
+    current_time: OffsetDateTime,
+    target_time: OffsetDateTime,
+    time_column: String,
+    client: google_cloud_bigquery::client::Client,
+    source_table: &TableReference,
+) -> anyhow::Result<storage::Iterator<storage::row::Row>> {
+    let row_restriction = format!(
+        "{time_column} >= timestamp_seconds({}) AND {time_column} < timestamp_seconds({})",
+        current_time.unix_timestamp(),
+        target_time.unix_timestamp(),
+        time_column = time_column,
+    );
+
+    let read_options = TableReadOptions {
+        row_restriction,
+        ..Default::default()
+    };
+
+    let retry_options = RetrySetting {
+        from_millis: 10,
+        max_delay: Some(Duration::from_secs(1)),
+        factor: 1u64,
+        take: 5,
+        codes: vec![Code::Unavailable, Code::Unknown],
+    };
+
+    let options = Some(
+        ReadTableOption::default()
+            .with_session_read_options(read_options)
+            .with_session_retry_setting(retry_options.clone())
+            .with_read_rows_retry_setting(retry_options),
+    );
+
+    Ok(client
+        .read_table::<storage::row::Row>(source_table, options)
+        .await?)
 }
